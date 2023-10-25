@@ -1,4 +1,4 @@
-use rug::{Complete, Integer, Rational};
+use rug::{Complete, Integer, Rational, Float};
 use ring::rand::{SystemRandom, SecureRandom};
 use rand::prelude::SliceRandom;
 use std::io::{self, Write};
@@ -22,7 +22,9 @@ fn random_integer_between(lower: &Integer, upper: &Integer) -> Integer {
 
 // Sample integers from the given distribution to create the public key
 fn sample_from_distribution(p: &Integer, lambda: u32) -> Integer {
+    // Choose q from (0, 2^(lambda^2) / p)
     let q = random_integer_between(&Integer::ZERO, &(Integer::u_pow_u(2, lambda.pow(2)).complete() / p.clone()));
+    // Choose r from (-2^lambda, 2^lambda)
     let r = random_integer_between(&Integer::u_pow_u(2, lambda).complete().as_neg(), &Integer::u_pow_u(2, lambda).complete());
     (p * q) + r
 }
@@ -32,12 +34,12 @@ fn string_to_binary(input: &str) -> String {
     input.chars().map(|c| format!("{:08b}", c as u8)).collect()
 }
 
-// Perform the balanced modulus operation (z mod p) ∈ (-p/2, p/2]
+// Perform the balanced modulo operation (z mod p) ∈ (-p/2, p/2]
 fn balanced_modulo(p: &Integer, z: &Integer) -> Integer {
     let mut remainder = z.clone() % p.clone();
     let half_p = p.clone() >> 1;  // equivalent to p/2
 
-    if &remainder > &half_p {
+    if remainder > half_p {
         remainder -= p.clone();
     }
 
@@ -57,7 +59,7 @@ fn binary_to_string(input: &str) -> Result<String, std::num::ParseIntError> {
 }
 
 // Generate the (public, private) keypair
-fn generate(lambda: u32) -> (Integer, Vec<u8>, Vec<Integer>, Vec<f64>) {
+fn generate(lambda: u32) -> (Integer, Vec<u8>, Vec<Integer>, Vec<Float>) {
     let mut sk: Integer;
 
     // Generate an odd integer in the given bounds
@@ -69,10 +71,10 @@ fn generate(lambda: u32) -> (Integer, Vec<u8>, Vec<Integer>, Vec<f64>) {
     // Length of the pk vector is (lambda^2 + lambda)
     let mut pk: Vec<Integer> = vec![Integer::ZERO; (lambda * (lambda + 1)) as usize];
 
-    // Set kappa as lambda^3 / 2
-    let kappa = lambda.pow(3) / 2;
-    
-    // Set theta as kappa * log2(lambda) (rounded)
+    // Set kappa as lambda^2 / 2
+    let kappa = lambda.pow(2) / 2;
+
+    // Set theta as kappa * ilog2(lambda)
     let theta = kappa * lambda.ilog2();
 
     // Set x_p = 2^kappa / p (rounded)
@@ -81,7 +83,7 @@ fn generate(lambda: u32) -> (Integer, Vec<u8>, Vec<Integer>, Vec<f64>) {
     // Create a vector with the given number of bits with Hamming weight lambda
     let mut s = vec![1; lambda as usize]
         .into_iter()
-        .chain(vec![0; (theta - lambda) as usize].into_iter())
+        .chain(vec![0; (theta - lambda) as usize])
         .collect::<Vec<u8>>();
 
     // Shuffle the vector to randomize it
@@ -96,7 +98,7 @@ fn generate(lambda: u32) -> (Integer, Vec<u8>, Vec<Integer>, Vec<f64>) {
 
     // Length of u vector is theta
     let mut u = vec![Integer::ZERO; theta as usize];
-    let mut y: Vec<f64>;
+    let mut y: Vec<Float>;
 
     loop {
         // Sample integers from the given distribution and assign to public key vector
@@ -125,7 +127,7 @@ fn generate(lambda: u32) -> (Integer, Vec<u8>, Vec<Integer>, Vec<f64>) {
 
         // Find the difference between x_p and sum_init modulo 2^(kappa + 1)
         let adjustment = xp.clone() - balanced_modulo(&Integer::from(2).pow(kappa + 1), &sum_init);
-        
+
         // Randomly add the adjustment to an element in one of the 'positions' indices to ensure
         // the sum of the elements equals x_p
         u[*positions.choose(&mut rand::thread_rng()).unwrap()] += adjustment;
@@ -134,22 +136,26 @@ fn generate(lambda: u32) -> (Integer, Vec<u8>, Vec<Integer>, Vec<f64>) {
         let sum = positions.iter().fold(Integer::from(0), |acc,  &index| acc + &u[index]);
 
         // Set y_i = u_i / 2^kappa
-        y = u.iter().map(|x| Rational::from((x.clone(), Integer::from(2).pow(kappa))).to_f64()).collect();
+        y = u.iter().map(|x| {
+                         let rational = Rational::from((x.clone(), Integer::from(2).pow(kappa)));
+                         Float::with_val(kappa, rational)
+                         }).collect();
 
         // Calculate the sum of the elements of the y vector in the indices with values equivalent
-        // to elements in positions
-        let sum_y = positions.iter().fold(0.0, |acc, &index| acc + y[index].clone());
+        // to elements in 'positions'
+        let sum_y = Float::with_val(kappa, positions.iter().fold(Float::with_val(64, 0.0), |acc, &index| acc + y[index].clone()));
 
         // Compute sum_y modulo 2
-        let sum_y_div_2  = sum_y.clone() / 2.0;
-
-        let sum_y_mod_2  = sum_y.clone() - (sum_y_div_2.clone().floor() * 2.0);
+        let sum_y_div_2: Float = sum_y.clone() / 2;
+        let sum_y_mod_2  = sum_y - (sum_y_div_2.floor() * 2.0);
 
         // Calculate the difference between sum_y mod 2 and 1/sk
-        let delta = sum_y_mod_2.clone() - Rational::from((1, sk.clone())).to_f64();
+        let sk_inverse = Float::with_val(kappa, Rational::from((1, sk.clone())));
+        let delta = Float::with_val(kappa, sum_y_mod_2 - sk_inverse);
 
-        // Break if sum = x_p (mod 2^(kappa + 1)) and |sum_y mod 2 - 1/sk| < 2^(lambda * (1 - lambda))
-        if balanced_modulo(&Integer::from(2).pow(kappa + 1), &(sum.clone() - xp.clone())) == 0 && delta.abs() <= 2f64.pow(lambda as i32 * (1 - lambda) as i32) { break; }
+        // Break if sum = x_p (mod 2^(kappa + 1)) and |sum_y mod 2 - 1/sk| < 2^(-kappa)
+        if balanced_modulo(&Integer::from(2).pow(kappa + 1), &(sum.clone() - xp.clone())) == 0 && 
+            delta.abs() <= Float::with_val(kappa, Rational::from((1, Integer::from(2).pow(kappa)))) { break; }
 
     }
 
@@ -157,13 +163,13 @@ fn generate(lambda: u32) -> (Integer, Vec<u8>, Vec<Integer>, Vec<f64>) {
 
 }
 
-// Encrypt plaintext bitwise given pk and lambda (from the somewhat homomorphic encryption scheme)
+// Encrypt plaintext bitwise given pk and lambda (from the somewhat-HE scheme)
 fn encrypt(m: &Integer, pk: &[Integer], lambda: u32) -> Integer {
 
     // Calculate the order of the random subset S
-    let order = random_integer_between(&Integer::ONE, &Integer::from(lambda * (lambda + 1)));
+    let order = random_integer_between(Integer::ONE, &Integer::from(lambda * (lambda + 1)));
 
-    // Calculate a random secondary noise parameter in the given bounds
+    // Calculate a random secondary noise parameter in the bound (-2^(2 * lambda), 2^(2 * lambda))
     let r = random_integer_between(&(Integer::ZERO - Integer::u_pow_u(2, lambda * 2).complete()), &Integer::u_pow_u(2, lambda * 2).complete());
 
     // Initialize the PRNG
@@ -179,134 +185,143 @@ fn encrypt(m: &Integer, pk: &[Integer], lambda: u32) -> Integer {
     balanced_modulo(&pk[0], &(m + (2 * r) + (2 * sum)))
 }
 
-// Evaluate the z vector for given ciphertext (from the bootstrappable homomorphic encryption variant)
-fn encrypt_evaluate(ciphertext: &Integer, y: &[f64]) -> Vec<f64> {
+// Evaluate the z-vector for given ciphertext (from the bootstrappable FHE variant)
+fn encrypt_evaluate(ciphertext: &Integer, y: &[Float], lambda: u32) -> Vec<Float> {
     // Set z_i = ciphertext * y_i (mod 2)
     y
         .iter()
         .map(|x| {
-            // Calculate div = x / 2 (rounded down)
-            let ciphertext = Rational::from((ciphertext.clone(), 1));
-            let yi = Rational::from_f64(x.clone()).unwrap();
-            let prod = ciphertext.clone() * yi.clone();
-            let mut prod_div_2: Rational = prod.clone() / 2;
-            prod_div_2.floor_mut();
-            // Calculate y = 2 * div
-            let y = 2 * prod_div_2;
             // Reduce modulo 2
+            let ciphertext = Float::with_val(lambda, ciphertext.clone());
+            let prod = ciphertext.clone() * x.clone();
+            let mut prod_div_2: Float = prod.clone() / 2;
+            prod_div_2.floor_mut();
+            let y = 2 * prod_div_2;
             let reduced = prod.clone() - y;
-            // Keep only 7 bits of precision after the binary point
-            let mut shifted: Rational = reduced * 128;
+            // Keep only ilog2(lambda) + 3 bits of precision after the binary point
+            let mut shifted: Float = reduced * (lambda.ilog2() + 3);
             shifted.floor_mut();
-            shifted = shifted / 128;
-            shifted.to_f64()
+            shifted /= lambda.ilog(2) + 3;
+            shifted
         })
-        .collect()
+    .collect()
 }
 
-// Decrypt ciphertext given sk (from the somewhat homomorphic encryption scheme)
+// Decrypt ciphertext given sk (from the somewhat-HE scheme)
 fn decrypt(ciphertext: &Integer, sk: &Integer) -> Integer {
-    // Calculate decrypted bit = ciphertext - (ciphertext / sk) (rounded) (mod 2)
-    balanced_modulo(sk, &ciphertext).modulo(&Integer::from(2))
-    
+    // Calculate decrypted bit = (ciphertext mod sk) (mod 2)
+    balanced_modulo(sk, ciphertext).modulo(&Integer::from(2))
 }
 
-// Decrypt ciphertext given s and z (from the squashed circuit of the bootstrappable homomorphic
-// encryption variant)
-fn decrypt_squash(ciphertext: &Integer, s: &[u8], z: &[f64]) -> Integer {
-    // Calculate the sum of s_i z_i (each of which will produce rational numbers at the 'positions'
+// Decrypt ciphertext given s and z (from the squashed decryption circuit of the bootstrappable FHE variant)
+fn decrypt_squash(ciphertext: &Integer, s: &[u8], z: &[Float]) -> Integer {
+    // Calculate the sum of s_i*z_i (each of which will produce rational numbers at the 'positions'
     // indices and 0 elsewhere)
-    let sum = Integer::from_f64(z.iter().zip(s.iter()).map(|(zi, &si)| zi * si as f64).sum::<f64>().round()).unwrap();
+    let sum = z.iter().zip(s.iter()).map(|(zi, &si)| zi * Float::with_val(64, si)).fold(Float::with_val(64, 0.0), |acc, x| acc + x);
+    let sum = sum.round();
+    let sum = sum.to_integer().unwrap();
 
     // Return ciphertext - sum (mod 2)
     (ciphertext - sum).modulo(&Integer::from(2))
 }
 
-// Perform basic single-depth homomorphic operations on multiple ciphertexts (addition, multiplication)
-// for testing
-fn homo_evaluate(sk: &Integer, s: &[u8], pk: &[Integer], y: &[f64], pt1: &str, pt2: &str) {
-    // Compute the encryption of pt1
-    let enc1: Vec<Integer> = string_to_binary(&pt1)
-        .chars()
-        .map(|x| encrypt(&Integer::from_str_radix(&x.to_string(), 2).unwrap(), &pk, 23))
-        .collect();
-
-    // Compute the encryption of pt2
-    let enc2: Vec<Integer> = string_to_binary(&pt2)
-        .chars()
-        .map(|x| encrypt(&Integer::from_str_radix(&x.to_string(), 2).unwrap(), &pk, 23))
-        .collect();
-
-    // Compute the z vector for (enc1 + enc2)
-    let z_sum: Vec<Vec<f64>> = enc1
-        .iter()
-        .zip(
-            enc2.iter())
-        .map(|(a, b)| encrypt_evaluate(&Integer::from(a + b), &y))
-        .collect();
-
-    // Compute the z vector for (enc1 * enc2) (does not seem to produce desired result with
-    // squashed decryption circuit probably due to overflow or precision issues, hence ignoring for now)
-    let z_prod: Vec<Vec<f64>> = enc1
-        .iter()
-        .zip(
-            enc2.iter())
-        .map(|(a, b)| encrypt_evaluate(&balanced_modulo(&pk[0], &Integer::from(a * b)), &y))
-        .collect();
+// Perform sample homomorphic evaluations using bivariate polynomials (ADD, MULT gates) for testing
+fn homo_evaluate(sk: &Integer, s: &[u8], pk: &[Integer], y: &[Float], pt1: &str, pt2: &str) {
+    println!("Sampling x as \'{pt1}\' and y as \'{pt2}\'\n");
 
     // Plaintexts have to be of the same length
     assert!(pt1.len() == pt2.len());
+
+    // Compute the encryption of pt1
+    let enc1: Vec<Integer> = string_to_binary(pt1)
+        .chars()
+        .map(|x| encrypt(&Integer::from_str_radix(&x.to_string(), 2).unwrap(), pk, 64))
+        .collect();
+
+    // Compute the encryption of pt2
+    let enc2: Vec<Integer> = string_to_binary(pt2)
+        .chars()
+        .map(|x| encrypt(&Integer::from_str_radix(&x.to_string(), 2).unwrap(), pk, 64))
+        .collect();
+
+    // Compute the encrypted polynomial operation (x^2 + 2xy + y^2) of enc1, enc2
+
+    // Compute the z-vector 
+    let z_x: Vec<Vec<Float>> = enc1
+        .iter()
+        .zip(
+            enc2.iter())
+        .map(|(a, b)| encrypt_evaluate(&(a.pow(2).complete() + (Integer::from(2 * a) * b) + b.pow(2).complete()), y, 64))
+        .collect();
+
+    // Compute the homomorphic encryption
+    let enc_x: Vec<Integer> = enc1
+        .iter()
+        .zip(
+            enc2.iter())
+        .map(|(x, y)| (x.pow(2).complete() + (Integer::from(2 * x) * y) + y.pow(2).complete()))
+        .collect();
+
+
+    // Compute the encrypted polynomial operation (x + y)^2 of enc1, enc2
+
+    // Compute the z-vector 
+    let z_y: Vec<Vec<Float>> = enc1
+        .iter()
+        .zip(
+            enc2.iter())
+        .map(|(a, b)| encrypt_evaluate(&(a + b).complete().pow(2), y, 64))
+        .collect();
+
+    // Compute the homomorphic encryption
+    let enc_y: Vec<Integer> = enc1
+        .iter()
+        .zip(
+            enc2.iter())
+        .map(|(x, y)| (x + y).complete().pow(2))
+        .collect();
+
+    // Compute the decryption of (enc_x, z_x) using the squashed circuit
+    let dec_x: String = enc_x
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+            let decrypted: Integer = decrypt_squash(x, s, &z_x[i]);
+            assert!(decrypted == decrypt(x, sk));
+            if decrypted == 0 { '0' } else { '1' }
+        })
+    .collect();
+
+    // Compute the decryption of (enc_y, z_y) using the squashed circuit
+    let dec_y: String = enc_y
+        .iter()
+        .enumerate()
+        .map(|(i, x)| {
+            let decrypted: Integer = decrypt_squash(x, s, &z_y[i]);
+            assert!(decrypted == decrypt(x, sk));
+            if decrypted == 0 { '0' } else { '1' }
+        })
+    .collect();
+
+    let dec_x = Integer::from_str_radix(&dec_x, 2).unwrap();
+    let dec_y = Integer::from_str_radix(&dec_y, 2).unwrap();
 
     // Compute the integral equivalent of the binary representation of pt1, pt2
     let pt1 = Integer::from_str_radix(&string_to_binary(pt1), 2).unwrap();
     let pt2 = Integer::from_str_radix(&string_to_binary(pt2), 2).unwrap();
 
-    // Compute the encrypted sum of the enc1, enc2
-    let enc_sum: Vec<Integer> = enc1
-        .iter()
-        .zip(
-            enc2.iter())
-        .map(|(x, y)| (x + y).complete())
-        .collect();
+    let eval = (pt1.clone() & pt1.clone()) ^ 
+             (pt1.clone() & pt2.clone()) ^ 
+             (pt1.clone() & pt2.clone()) ^ 
+             (pt2.clone() & pt2.clone());
 
-    // Compute the encrypted product of enc1, enc2
-    let enc_prod: Vec<Integer> = enc1
-        .iter()
-        .zip(
-            enc2.iter())
-        .map(|(x, y)| (x * y).complete())
-        .collect();
+    println!("Evaluation on plaintexts: {eval}");
+    println!("Decryption of evaluated result for (x^2 + 2xy + y^2): {dec_x}");
+    println!("Decryption of evaluated result for (x + y)^2: {dec_y}");
 
-    // Compute the decryption of enc_sum, z_sum
-    let dec_sum: String = enc_sum
-        .iter()
-        .enumerate()
-        .map(|(i, x)| {
-            let decrypted: Integer = decrypt_squash(x, &s, &z_sum[i]);
-            assert!(decrypted == decrypt(x, &sk));
-            if decrypted == Integer::from(0) { '0' } else { '1' }
-            })
-    .collect();
-
-    // Compute the decryption of enc_prod (squashed decryption circuit does not seem to produce
-    // desired result, perhaps due to overflow or precision issues, hence using standard scheme)
-    let dec_prod: String = enc_prod
-        .iter()
-        .enumerate()
-        .map(|(i, x)| {
-            // let decrypted = decrypt_squash(x, s, &z_prod[i]);
-            let decrypted: Integer = decrypt(x, &sk);
-            if decrypted == Integer::from(0) { '0' } else { '1' }
-            })
-    .collect();
-
-    println!("dec_sum: {}", Integer::from_str_radix(&dec_sum, 2).unwrap());
-    println!("add/XOR: {}", pt1.clone() ^ pt2.clone());
-    println!("dec_prod: {}", Integer::from_str_radix(&dec_prod, 2).unwrap());
-    println!("mult/AND: {}", pt1.clone() & pt2.clone());
-
-    assert!(Integer::from_str_radix(&dec_sum, 2).unwrap() == pt1.clone() ^ pt2.clone());
-    assert!(Integer::from_str_radix(&dec_prod, 2).unwrap() == pt1 & pt2);
+    // Ensure correctness of homomorphic evaluation
+    assert!(dec_x == eval);
+    assert!(dec_y == eval);
 
     println!("\nHomomorphism verified.");
 }
@@ -320,9 +335,8 @@ fn main() {
 
     let plaintext = input.trim();
 
-    // Set lambda to 23 for testing, higher values seem to take more time and introduce more
-    // overflow/precision issues
-    let (sk, s, pk, y) = generate(23);
+    // Set lambda to 64 for testing
+    let (sk, s, pk, y) = generate(64);
 
     println!("sk: {sk}");
     println!("\npk: {pk:?}");
@@ -331,29 +345,29 @@ fn main() {
     assert!(pk[0] == pk.iter().fold(Integer::ZERO, |max, val| if val > &max { val.clone() } else { max }));
 
     // Compute the encryption of plaintext
-    let enc: Vec<Integer> = string_to_binary(&plaintext)
+    let enc: Vec<Integer> = string_to_binary(plaintext)
         .chars()
-        .map(|x| encrypt(&Integer::from_str_radix(&x.to_string(), 2).unwrap(), &pk, 23))
+        .map(|x| encrypt(&Integer::from_str_radix(&x.to_string(), 2).unwrap(), &pk, 64))
         .collect();
-    
-    // Compute the z vector corresponding to the encrypted ciphertext
-    let z: Vec<Vec<f64>> = enc
+
+    // Compute the z-vector corresponding to the encrypted ciphertext
+    let z: Vec<Vec<Float>> = enc
         .iter()
-        .map(|x| encrypt_evaluate(x, &y))
+        .map(|x| encrypt_evaluate(x, &y, 64))
         .collect();
 
     println!("\nEncrypted: {enc:?}");
 
     // Perform decryption using the squashed circuit and ensure the resultant bits are equivalent
-    // to that produced by the somewhat homomorphic encryption scheme
+    // to that produced by the somewhat-HE scheme
     let dec: String = enc
         .iter()
         .enumerate()
         .map(|(i, x)| {
             let decrypted: Integer = decrypt_squash(x, &s, &z[i]);
             assert!(decrypted == decrypt(x, &sk));
-            if decrypted == Integer::from(0) { '0' } else { '1' }
-            })
+            if decrypted == 0 { '0' } else { '1' }
+        })
     .collect();
 
     // Convert binary to UTF-8 string
@@ -364,6 +378,6 @@ fn main() {
     // Ensure correctness of encryption/decryption
     assert!(dec == plaintext);
 
-    // Sample homomorphic evaluation
-    homo_evaluate(&sk, &s, &pk, &y, "Hello", "World");
+    // Sample homomorphic evaluation with ADD/MULT gates
+    homo_evaluate(&sk, &s, &pk, &y, "Homomorphic", "Encryption!");
 }
